@@ -3,7 +3,7 @@
 
 [![Static Badge](https://img.shields.io/badge/📰-Notion-grey)](https://foremost-success-91b.notion.site/DreamOn-Diffusion-Language-Models-For-Code-Infilling-Beyond-Fixed-Size-Canvas-228be544bdbb80cc991ef540e7805bd7)
 [![Static Badge](https://img.shields.io/badge/📰-Blog-red)](https://hkunlp.github.io/blog/2025/dreamon/)
-[![Static Badge](https://img.shields.io/badge/📰-Demo\(ComingSoon\)-green)]()
+[![Static Badge](https://img.shields.io/badge/📰-Demo-green)](https://huggingface.co/spaces/ZiruiWu/DreamOn-v0-7B)
 [![Static Badge](https://img.shields.io/badge/Hugging%20Face%20🤗-DreamOn%207B-blue)
 ](https://huggingface.co/Dream-org/DreamOn-v0-7B)
 
@@ -24,6 +24,7 @@ This work is done as part of the [HKU NLP Group](https://hkunlp.github.io/) and 
 </div>
 
 ## News
+[2025/7/23] We open-source our code for training and evaluation. We also release a demo for DreamOn on Hugging Face Spaces. You can try it out [here](https://huggingface.co/spaces/ZiruiWu/DreamOn-v0-7B).
 [2025/7/15] We release our model [DreamOn](https://huggingface.co/Dream-org/DreamOn-v0-7B) and its accompanying model [DreamCoder](https://github.com/DreamLM/Dream-Coder).
 
 ## Installation
@@ -110,7 +111,23 @@ for i, h in enumerate(history):
 Note: We currently do not support attention mask, as we recompute attention mask each denoising step to support variable-length generation.
 
 ## Evaluation
-Coming soon...
+Use the following command to replicate our results.
+```
+git clone https://github.com/openai/human-eval-infilling
+pip install -e human-eval-infilling
+pip install omegaconf
+```
+```
+bash eval/eval_humaneval_infilling.sh
+bash eval/eval_santa_fim.sh
+```
+
+## Training
+Our training implementation is built upon the SFT trainer from [verl](https://github.com/volcengine/verl). To train DreamOn, please install verl first, and then execute the following command:
+```
+python data/prepare_data.py
+bash run_dreamon.sh
+```
 
 ## Citation
 ```bibtex
