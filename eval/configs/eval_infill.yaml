@@ -1,0 +1,23 @@
+name: "evals"
+task: null
+ckpt_dir: dummy
+fix_middle_length: null
+prediction_path: null
+overwrite: false
+mask_expansion: true
+
+generator:
+  dtype: bf16
+  steps: 128
+  max_gen_len: 64
+  min_gen_len: 4
+  alg: entropy
+  batch_size: 1
+  pad_to_max_len: false
+  alg_temp: 0.0
+  temperature: 0.1
+  top_p: 0.9
+  delete_eos_token: true
+  pad_eos_to_right: true
+
+batch_size: 32
