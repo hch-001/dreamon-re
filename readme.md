@@ -24,7 +24,8 @@ This work is done as part of the [HKU NLP Group](https://hkunlp.github.io/) and 
 </div>
 
 ## News
-[2025/7/23] We open-source our code for training and evaluation. We also release a demo for DreamOn on Hugging Face Spaces. You can try it out [here](https://huggingface.co/spaces/ZiruiWu/DreamOn-v0-7B).
+[2025/7/25] We open-source our code for training and evaluation. We also release a demo for DreamOn on Hugging Face Spaces. You can try it out [here](https://huggingface.co/spaces/ZiruiWu/DreamOn-v0-7B).
+
 [2025/7/15] We release our model [DreamOn](https://huggingface.co/Dream-org/DreamOn-v0-7B) and its accompanying model [DreamCoder](https://github.com/DreamLM/Dream-Coder).
 
 ## Installation
@@ -134,7 +135,7 @@ bash run_dreamon.sh
 @misc{Dreamon2025,
     title = {DreamOn: Diffusion Language Models For Code Infilling Beyond Fixed-size Canvas},
     url = {https://hkunlp.github.io/blog/2025/dreamon},
-    author = {Wu, Zirui and Zheng, Lin and Xie, Zhihui and Ye, Jiacheng and Gao, Jiahui and Feng, Yansong and Li, Zhenguo and W., Victoria and Zhou, Guorui  and Kong, Lingpeng}
+    author = {Wu, Zirui and Zheng, Lin and Xie, Zhihui and Ye, Jiacheng and Gao, Jiahui and Feng, Yansong and Li, Zhenguo and W., Victoria and Zhou, Guorui  and Kong, Lingpeng},
     year = {2025}
 }
 ```
