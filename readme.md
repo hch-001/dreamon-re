@@ -11,7 +11,7 @@
 
 DreamOn is a novel discrete diffusion algorithm designed to address the variable-length generation challenge in code infilling. Unlike current discrete diffusion language models, our approach enables dynamic expansion and contraction of mask tokens during inference, providing flexible length control without requiring predetermined canvas sizes.
 
-This work is done as part of the [HKU NLP Group](https://hkunlp.github.io/) and [Kuaishou Technology](https://www.kuaishou.com/).
+This work is done as part of the [HKU NLP Group](https://hkunlp.github.io/) and [Klear Team@Kuaishou Technology](https://github.com/Kwai-Klear).
 
 <div style="display: flex">
   <figure style="margin: 0; text-align: center;">
