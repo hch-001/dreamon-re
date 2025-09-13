@@ -16,7 +16,7 @@ def tokenize_and_filter_row(row):
     try:
         prompt_len = len(tokenizer.tokenize(row['prompt']))
         response_len = len(tokenizer.tokenize(row['response']))
-        return (prompt_len + response_len) <= 4096
+        return (prompt_len + response_len) <= 1024
     except Exception as e:
         print(f"Error tokenizing row: {e}")
         return False
