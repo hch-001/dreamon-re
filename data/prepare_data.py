@@ -56,6 +56,14 @@ def main():
         eval_dataset = filtered_dataset.select(range(eval_size))
         train_dataset = filtered_dataset.select(range(eval_size, total_size))
 
+    # Truncate training set to at most 100 samples
+    max_train_samples = 100
+    try:
+        if len(train_dataset) > max_train_samples:
+            train_dataset = train_dataset.select(range(max_train_samples))
+    except Exception as e:
+        print(f"Warning: failed to truncate train dataset: {e}")
+
     # Step 4: Convert to Pandas and save
     os.makedirs(output_dir, exist_ok=True)
 

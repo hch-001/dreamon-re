@@ -1,8 +1,8 @@
 import time
 import torch
 from transformers import AutoModel, AutoTokenizer
-
-
+import os
+from transformers.utils import cached_file
 
 def process_infilling_prompt(prefix, suffix, tokenizer, number_of_mask):
     prefix = [tokenizer.bos_token_id] + tokenizer.encode(prefix, add_special_tokens=False)
@@ -42,7 +42,24 @@ def has_close_elements(numbers: List[float], threshold: float) -> bool:
     model = AutoModel.from_pretrained(model_path, torch_dtype=torch.bfloat16, trust_remote_code=True)
     model = model.to("cuda").eval()
 
+    # 输出模型的实际路径
+    print(f"✅ 模型加载完成")
+    print(f"📂 模型本地路径: {model.name_or_path}")
+    print(f"📂 Tokenizer 本地路径: {tokenizer.name_or_path}")
 
+    # 如果需要更详细的缓存路径
+    if os.path.exists(model.name_or_path):
+        print(f"📁 模型文件存放在: {os.path.abspath(model.name_or_path)}")
+    else:
+        print("⚠️ 模型路径未在本地文件系统中找到（可能是远程加载）")
+
+    # 找出模型在磁盘的实际缓存路径
+    config_path = cached_file(model_path, "config.json")
+    real_model_dir = os.path.dirname(config_path)
+
+    print(f"✅ 模型加载完成")
+    print(f"📂 模型缓存目录: {real_model_dir}")
+    
     output = model.diffusion_generate(
         input_ids,
         temperature=0.2,

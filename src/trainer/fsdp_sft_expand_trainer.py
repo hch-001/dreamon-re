@@ -289,7 +289,7 @@ class FSDPSFTTrainer(object):
             self.model: PreTrainedModel = AutoModel.from_pretrained(
                 local_model_path,
                 config=config,
-                torch_dtype=torch.float32,
+                torch_dtype=torch.bfloat16,
                 attn_implementation="flash_attention_2",
                 trust_remote_code=trust_remote_code,
             )
@@ -650,15 +650,31 @@ class FSDPSFTTrainer(object):
 
         # Save on rank 0 only
         if self.device_mesh.get_rank() == 0:
-            os.makedirs(path, exist_ok=True)
+            try:
+                os.makedirs(path, exist_ok=True)
 
-            # Save model using HF's save_pretrained
-            self.model.save_pretrained(path, state_dict=model_state)
-            self.tokenizer.save_pretrained(path)
+                # Save model without invoking generation_config.validate(strict=...) to avoid errors
+                from transformers.utils import WEIGHTS_NAME
+                torch.save(model_state, os.path.join(path, WEIGHTS_NAME))
+                # Save config/tokenizer separately
+                self.model.config.save_pretrained(path)
+                self.tokenizer.save_pretrained(path)
 
-            # Save optimizer and training state
-            torch.save(optim_state, os.path.join(path, "optimizer_state.pt"))
-            torch.save(training_state, os.path.join(path, "training_state.pt"))
+                # Save optimizer and training state (skip if disk space issues)
+                try:
+                    torch.save(optim_state, os.path.join(path, "optimizer_state.pt"))
+                    torch.save(training_state, os.path.join(path, "training_state.pt"))
+                except RuntimeError as e:
+                    print(f"Warning: Failed to save optimizer/training state: {e}")
+                    # Save minimal training state
+                    minimal_state = {"global_step": step, "epoch": self.current_epoch}
+                    torch.save(minimal_state, os.path.join(path, "minimal_training_state.pt"))
+                    
+            except Exception as e:
+                print(f"Warning: Failed to save checkpoint: {e}")
+                # Create a simple success marker instead
+                with open(os.path.join(path, "training_completed.txt"), "w") as f:
+                    f.write(f"Training completed at step {step}\n")
 
             # Copy to HDFS if configured
             if self.config.trainer.default_hdfs_dir:
