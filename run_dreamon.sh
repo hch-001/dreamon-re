@@ -17,8 +17,8 @@ exec 2> >(tee "$stderr_log" >&2)
 echo "Training with learning rate: $lr"
 echo "Checkpoint directory: $ckpt_dir"
 
-CUDA_VISIBLE_DEVICES=0,1,2,3 \
-torchrun --standalone --nnodes=1 --nproc_per_node=4      --master-port 12346 \
+CUDA_VISIBLE_DEVICES=0,1 \
+torchrun --standalone --nnodes=1 --nproc_per_node=2      --master-port 12346 \
     -m src.trainer.fsdp_sft_expand_trainer \
     diffusion.time_reweighting=linear \
     diffusion.weight_eos=true \

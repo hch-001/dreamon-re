@@ -12,9 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import json
-
 import os
+import json
 
 os.environ["NCCL_DEBUG"] = "WARN"
 os.environ["TOKENIZERS_PARALLELISM"] = "true"
@@ -23,6 +22,17 @@ import logging
 import math
 import re
 from contextlib import nullcontext
+
+class FileLogger:
+    def __init__(self, log_path):
+        self.log_path = log_path
+        # Create directory if it doesn't exist
+        os.makedirs(os.path.dirname(log_path), exist_ok=True)
+        
+    def log(self, data):
+        with open(self.log_path, 'a') as f:
+            json.dump(data, f)
+            f.write('\n')
 
 import hydra
 import numpy as np
@@ -58,9 +68,6 @@ from verl.utils.ulysses import (
 from verl.workers.sharding_manager.fsdp_ulysses import FSDPUlyssesShardingManager
 
 from src.trainer.sft_expand_dataset import SFTExpandDataset
-from src.trainer.logging_utils import FileLogger
-import signal
-import time
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_SFT_LOGGING_LEVEL", "WARN"))
@@ -94,19 +101,70 @@ class FSDPSFTTrainer(object):
     def __init__(
         self, config, device_mesh: DeviceMesh, ulysses_device_mesh: DeviceMesh
     ):
+        from omegaconf import OmegaConf
         self.config = config
         self.device_mesh = device_mesh
         self.ulysses_device_mesh = ulysses_device_mesh
         self.sharding_manager = FSDPUlyssesShardingManager(self.ulysses_device_mesh)
-
-        # Early stopping state (None disables early stopping)
-        self.best_val_loss = float("inf")
-        self.no_improve_steps = 0
-        self.early_stop_patience = getattr(self.config.trainer, "early_stopping_patience", None)
-        self.early_stop_min_delta = getattr(self.config.trainer, "early_stopping_min_delta", 0.0)
-
+        
+        # 设置默认目录，使用 OmegaConf.create 创建新的配置
+        default_config = {
+            "trainer": {
+                "default_local_dir": getattr(config.trainer, "default_local_dir", "checkpoints"),
+                "log_dir": getattr(config.trainer, "log_dir", None)
+            }
+        }
+        default_config["trainer"]["log_dir"] = default_config["trainer"]["log_dir"] or \
+            os.path.join(default_config["trainer"]["default_local_dir"], "logs")
+            
+        # 合并配置
+        self.config = OmegaConf.merge(default_config, config)
+        
+        # 创建日志和检查点目录
+        os.makedirs(self.config.trainer.default_local_dir, exist_ok=True)  # 检查点目录
+        os.makedirs(self.config.trainer.log_dir, exist_ok=True)  # 日志目录
+        
+        # 修改文件日志器路径
+        log_path = os.path.join(self.config.trainer.log_dir, "training_log.jsonl")
+        
+        # 修改loss历史记录路径
+        self.loss_history_path = os.path.join(self.config.trainer.log_dir, 'loss_history.json')
+        
         # Add tracking for current epoch
         self.current_epoch = 0
+
+        # Best checkpoint tracking (only keep best)
+        self.best_val_loss = float("inf")
+        self.min_delta = getattr(self.config.trainer, "min_delta", 1e-4)
+        self.best_checkpoint_path = None
+        
+        # 用于跟踪当前训练步骤
+        self.current_step = 0
+        
+        # 添加信号处理器用于 CTRL+C
+        if self.device_mesh.get_rank() == 0:  # 只在主进程添加处理器
+            import signal
+            def signal_handler(signum, frame):
+                print("\nReceived Ctrl+C. Attempting to save checkpoint...")
+                try:
+                    # 如果已经有最佳检查点，就不需要再保存
+                    if not self.best_checkpoint_path:
+                        self.save_checkpoint(step=self.current_step, is_best=False)
+                        print(f"Emergency checkpoint saved at step {self.current_step}")
+                    else:
+                        print("Best checkpoint already exists, skipping emergency save")
+                except Exception as e:
+                    print(f"Failed to save emergency checkpoint: {e}")
+                finally:
+                    print("Exiting...")
+                    import sys
+                    sys.exit(0)
+            
+            signal.signal(signal.SIGINT, signal_handler)
+        
+        # Early stopping configuration
+        self.no_improvement_count = 0
+        self.max_no_improvement = getattr(self.config.trainer, "max_no_improvement", 1)  # 默认值为1
 
         # Check if resuming training
         self.resume_training = getattr(self.config.trainer, "resume_training", False)
@@ -635,26 +693,45 @@ class FSDPSFTTrainer(object):
             torch.distributed.all_reduce(loss, op=torch.distributed.ReduceOp.AVG)
         return loss
 
-    def save_checkpoint(self, step):
+    def save_checkpoint(self, step, is_best=False):
         """Save model, optimizer, and training state."""
         from torch.distributed.fsdp import FullStateDictConfig, StateDictType
         from torch.distributed.fsdp.api import FullOptimStateDictConfig
+        import shutil
+        import os
 
         # Create checkpoint directory
         path = os.path.join(
             self.config.trainer.default_local_dir, f"global_step_{step}"
         )
+        
+        # 在保存新的checkpoint之前，如果是最佳checkpoint，先删除旧的
+        if is_best and self.device_mesh.get_rank() == 0 and self.best_checkpoint_path:
+            try:
+                # 删除本地旧checkpoint
+                if os.path.exists(self.best_checkpoint_path):
+                    try:
+                        shutil.rmtree(self.best_checkpoint_path)
+                    except Exception as e:
+                        print(f"Warning: Failed to delete local checkpoint: {e}")
+                
+                # 删除HDFS上的旧checkpoint
+                if self.config.trainer.default_hdfs_dir:
+                    try:
+                        prev_name = os.path.basename(self.best_checkpoint_path)
+                        remote_prev = os.path.join(self.config.trainer.default_hdfs_dir, prev_name)
+                        if hdfs_io.exists(remote_prev):
+                            hdfs_io.rmtree(remote_prev)
+                    except Exception as e:
+                        print(f"Warning: Failed to delete HDFS checkpoint: {e}")
+            except Exception as e:
+                print(f"Warning: Failed to delete previous checkpoint: {e}")
 
-        # Save model state in fp16
+        # Save model state
         model_cfg = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
 
         with FSDP.state_dict_type(self.fsdp_model, StateDictType.FULL_STATE_DICT, model_cfg):
             model_state = self.fsdp_model.state_dict()
-            # Convert model weights to fp16
-            for key in model_state:
-                if isinstance(model_state[key], torch.Tensor):
-                    model_state[key] = model_state[key].half()
-            
             optim_state = FSDP.full_optim_state_dict(self.fsdp_model, self.optimizer)
 
         # Save training state
@@ -667,49 +744,90 @@ class FSDPSFTTrainer(object):
         # Save on rank 0 only
         if self.device_mesh.get_rank() == 0:
             try:
+                # 1. 创建新的checkpoint目录
                 os.makedirs(path, exist_ok=True)
 
-                # Save model in fp16 format
-                from transformers.utils import WEIGHTS_NAME
-                
-                # Add fp16 flag to config
-                self.model.config.torch_dtype = "float16"
-                
-                # Save model weights in fp16
-                torch.save(model_state, os.path.join(path, WEIGHTS_NAME))
-                
-                # Save config/tokenizer separately
-                self.model.config.save_pretrained(path)
-                self.tokenizer.save_pretrained(path)
-                
-                # Save a marker file indicating this is an fp16 checkpoint
-                with open(os.path.join(path, "fp16_config.json"), "w") as f:
-                    json.dump({"dtype": "float16"}, f)
+                # 2. 保存模型
+                # Some custom GenerationConfig implementations (e.g. DreamGenerationConfig)
+                # may define `validate()` without accepting the `strict` kwarg which
+                # `transformers` passes when calling `generation_config.save_pretrained()`.
+                # That causes a TypeError. To be robust, temporarily wrap the
+                # generation_config.validate to accept/ignore `strict` during save.
+                gen_cfg = getattr(self.model, "generation_config", None)
+                _saved_validate = None
+                if gen_cfg is not None and hasattr(gen_cfg, "validate"):
+                    try:
+                        import inspect
 
-                # Save optimizer and training state (skip if disk space issues)
+                        sig = inspect.signature(gen_cfg.validate)
+                        if "strict" not in sig.parameters:
+                            _saved_validate = gen_cfg.validate
+
+                            def _validate_wrapper(*args, **kwargs):
+                                # filter kwargs to those accepted by the original
+                                filtered = {k: v for k, v in kwargs.items() if k in sig.parameters}
+                                return _saved_validate(*args, **filtered)
+
+                            gen_cfg.validate = _validate_wrapper
+                    except Exception:
+                        # If introspection fails for any reason, ignore and proceed
+                        _saved_validate = None
+
                 try:
-                    torch.save(optim_state, os.path.join(path, "optimizer_state.pt"))
-                    torch.save(training_state, os.path.join(path, "training_state.pt"))
-                except RuntimeError as e:
-                    print(f"Warning: Failed to save optimizer/training state: {e}")
-                    # Save minimal training state
-                    minimal_state = {"global_step": step, "epoch": self.current_epoch}
-                    torch.save(minimal_state, os.path.join(path, "minimal_training_state.pt"))
+                    # Before saving, remove any non-serializable attributes from generation_config
+                    if hasattr(self.model, "generation_config"):
+                        gen_config_dict = self.model.generation_config.to_dict()
+                        # Filter out function attributes
+                        gen_config_dict = {k: v for k, v in gen_config_dict.items() 
+                                         if not callable(v)}
+                        # Save filtered config
+                        gen_config_path = os.path.join(path, "generation_config.json")
+                        with open(gen_config_path, "w") as f:
+                            json.dump(gen_config_dict, f, indent=2)
                     
-            except Exception as e:
-                print(f"Warning: Failed to save checkpoint: {e}")
-                # Create a simple success marker instead
-                with open(os.path.join(path, "training_completed.txt"), "w") as f:
-                    f.write(f"Training completed at step {step}\n")
+                    # Save model without generation config
+                    gen_config_backup = None
+                    if hasattr(self.model, "generation_config"):
+                        gen_config_backup = self.model.generation_config
+                        self.model.generation_config = None
+                    try:
+                        self.model.save_pretrained(path, state_dict=model_state)
+                    finally:
+                        # Restore generation config
+                        if gen_config_backup is not None:
+                            self.model.generation_config = gen_config_backup
+                finally:
+                    # restore original validate if we wrapped it
+                    if _saved_validate is not None and gen_cfg is not None:
+                        try:
+                            gen_cfg.validate = _saved_validate
+                        except Exception:
+                            pass
+                self.tokenizer.save_pretrained(path)
+                torch.save(optim_state, os.path.join(path, "optimizer_state.pt"))
+                torch.save(training_state, os.path.join(path, "training_state.pt"))
 
-            # Copy to HDFS if configured
-            if self.config.trainer.default_hdfs_dir:
-                hdfs_io.makedirs(self.config.trainer.default_hdfs_dir, exist_ok=True)
-                hdfs_io.copy(
-                    src=path,
-                    dst=self.config.trainer.default_hdfs_dir,
-                    dirs_exist_ok=True,
-                )
+                # 3. 复制到HDFS
+                if self.config.trainer.default_hdfs_dir:
+                    try:
+                        hdfs_io.makedirs(self.config.trainer.default_hdfs_dir, exist_ok=True)
+                        hdfs_io.copy(src=path, dst=self.config.trainer.default_hdfs_dir, dirs_exist_ok=True)
+                    except Exception as e:
+                        print(f"Warning: Failed to copy to HDFS: {e}")
+                
+                # 4. 保存成功后更新best_checkpoint_path
+                if is_best:
+                    self.best_checkpoint_path = path
+
+            except Exception as e:
+                print(f"Error in save_checkpoint: {e}")
+                # 保存失败时，删除部分完成的新checkpoint
+                if os.path.exists(path):
+                    try:
+                        shutil.rmtree(path)
+                    except Exception:
+                        pass
+                raise
         torch.distributed.barrier()
 
     def _find_latest_checkpoint(self):
@@ -757,40 +875,14 @@ class FSDPSFTTrainer(object):
 
     def fit(self):
         rank = self.device_mesh.get_rank()
-
+        hist_path = self.loss_history_path
         # TODO: add a unified tracking
         if rank == 0:
-            avg_val_loss = torch.mean(torch.stack(val_losses))
-            metric = {"val/loss": avg_val_loss.detach().item()}
-            tracking.log(data=metric, step=global_step)
-
-            # 保存到日志
-            if getattr(self, 'file_logger', None) is not None:
-                try:
-                    self.file_logger.log(metric, step=global_step)
-                except Exception as e:
-                    print(f"Warning: failed to persist val metric: {e}")
-
-            # 同步保存到 loss_history.json
-            try:
-                entry = {'step': global_step, 'val/loss': metric['val/loss']}
-                self.loss_history.append(entry)
-                hist_path = os.path.join(self.config.trainer.default_local_dir, 'loss_history.json')
-                with open(hist_path, 'w', encoding='utf-8') as hf:
-                    import json
-                    json.dump(self.loss_history, hf, ensure_ascii=False, indent=2)
-            except Exception as e:
-                print(f"Warning: failed to persist val loss_history: {e}")
-
-            # 仅保存最优 checkpoint，先删后存
-            improved = self.save_best_checkpoint(global_step, metric["val/loss"])
-            if improved:
-                print(f"New best checkpoint saved at step {global_step} (val_loss={metric['val/loss']:.4f})")
-            else:
-                print(f"No improvement at step {global_step} (val_loss={metric['val/loss']:.4f})")
-
-        torch.distributed.barrier()
-
+            tracking = Tracking(
+                project_name=self.config.trainer.project_name,
+                experiment_name=self.config.trainer.experiment_name,
+                default_backend=self.config.trainer.logger,
+            )
 
         global_step = 0
 
@@ -844,160 +936,99 @@ class FSDPSFTTrainer(object):
             if epoch == self.current_epoch and global_step > 0 and self.resume_training:
                 remaining_steps -= global_step % self.steps_per_epoch
 
-            try:
-                for data in tqdm(
-                    dataloader_iter,
-                    initial=self.steps_per_epoch - remaining_steps,
-                    total=self.steps_per_epoch,
-                    desc=f"Epoch {epoch+1}/{self.config.trainer.total_epochs}",
-                ):
-                    data = TensorDict(data, batch_size=self.config.data.train_batch_size).cuda()
-                    metric = self.training_step(data)
-                    if rank == 0:
-                        tracking.log(data=metric, step=global_step)
-                        # append to in-memory loss history and file logger
-                        try:
-                            if 'train/loss' in metric:
-                                entry = {'step': global_step, 'train/loss': metric['train/loss']}
-                                self.loss_history.append(entry)
-                                # Persist loss_history to JSON file (overwrite)
-                                try:
-                                    hist_path = os.path.join(self.config.trainer.default_local_dir, 'loss_history.json')
-                                    with open(hist_path, 'w', encoding='utf-8') as hf:
-                                        import json
-                                        json.dump(self.loss_history, hf, ensure_ascii=False, indent=2)
-                                except Exception as e:
-                                    print(f"Warning: failed to persist loss_history: {e}")
-                            if getattr(self, 'file_logger', None) is not None:
-                                self.file_logger.log(metric, step=global_step)
-                        except Exception as e:
-                            print(f"Warning: failed to persist metric: {e}")
-                    global_step += 1
-                    # store last global step for signal handler
-                    if rank == 0:
-                        self.last_global_step = global_step
-
-                    # for early exit validation
-                    if global_step >= self.total_training_steps:
-                        # Perform final validation
-                        val_losses = []
-                        for val_data in self.val_dataloader:
-                            val_data = TensorDict(
-                                val_data,
-                                batch_size=self.config.data.micro_batch_size_per_gpu,
-                            ).cuda()
-                            val_loss = self.validation_step(val_data)
-                            val_losses.append(val_loss)
-                        if rank == 0:
-                            avg_val_loss = torch.mean(torch.stack(val_losses))
-                            metric = {"val/loss": avg_val_loss.detach().item()}
-                            tracking.log(data=metric, step=global_step)
-                            if getattr(self, 'file_logger', None) is not None:
-                                try:
-                                    self.file_logger.log(metric, step=global_step)
-                                    self.loss_history.append({'step': global_step, 'val/loss': metric['val/loss']})
-                                except Exception as e:
-                                    print(f"Warning: failed to persist val metric: {e}")
-                            # Early stopping decision (rank 0) with distributed broadcast
-                            # Create stop tensor on all ranks
-                            stop_tensor = torch.zeros(1, dtype=torch.int64, device='cuda')
-                            if self.early_stop_patience is not None and rank == 0:
-                                val = float(metric['val/loss'])
-                                if val + self.early_stop_min_delta < self.best_val_loss:
-                                    self.best_val_loss = val
-                                    self.no_improve_steps = 0
-                                else:
-                                    self.no_improve_steps += 1
-                                if self.no_improve_steps >= self.early_stop_patience:
-                                    stop_tensor[0] = 1
-                            # broadcast stop decision from rank 0 to all
-                            torch.distributed.broadcast(stop_tensor, src=0)
-                            if int(stop_tensor.item()) == 1:
-                                if rank == 0:
-                                    print(f"Early stopping triggered at step {global_step}")
-                                    # ensure final checkpoint is saved
-                                    try:
-                                        self.save_checkpoint(step=global_step)
-                                    except Exception as e:
-                                        print(f"Warning: failed to save final checkpoint on early stop: {e}")
-                                torch.distributed.barrier()
-                                return
-                        torch.distributed.barrier()
-
-                        # Save final checkpoint
-                        self.save_checkpoint(step=global_step)
-                        return
-
-                    if global_step % self.config.trainer.save_checkpoint_steps == 0:
-                        # Perform validation
-                        val_losses = []
-                        for val_data in self.val_dataloader:
-                            val_data = TensorDict(
-                                val_data,
-                                batch_size=self.config.data.micro_batch_size_per_gpu,
-                            ).cuda()
-                            val_loss = self.validation_step(val_data)
-                            val_losses.append(val_loss)
-                        if rank == 0:
-                            avg_val_loss = torch.mean(torch.stack(val_losses))
-                            metric = {"val/loss": avg_val_loss.detach().item()}
-                            tracking.log(data=metric, step=global_step)
-                            if getattr(self, 'file_logger', None) is not None:
-                                try:
-                                    self.file_logger.log(metric, step=global_step)
-                                except Exception as e:
-                                    print(f"Warning: failed to persist val metric: {e}")
-                            # Save validation loss into loss_history as well and persist
-                            try:
-                                entry = {'step': global_step, 'val/loss': metric['val/loss']}
-                                self.loss_history.append(entry)
-                                hist_path = os.path.join(self.config.trainer.default_local_dir, 'loss_history.json')
-                                with open(hist_path, 'w', encoding='utf-8') as hf:
-                                    import json
-                                    json.dump(self.loss_history, hf, ensure_ascii=False, indent=2)
-                            except Exception as e:
-                                print(f"Warning: failed to persist val loss_history: {e}")
-                            # Early stopping decision (rank 0) with distributed broadcast
-                            stop_tensor = torch.zeros(1, dtype=torch.int64, device='cuda')
-                            if self.early_stop_patience is not None and rank == 0:
-                                val = float(metric['val/loss'])
-                                if val + self.early_stop_min_delta < self.best_val_loss:
-                                    self.best_val_loss = val
-                                    self.no_improve_steps = 0
-                                else:
-                                    self.no_improve_steps += 1
-                                if self.no_improve_steps >= self.early_stop_patience:
-                                    stop_tensor[0] = 1
-                            torch.distributed.broadcast(stop_tensor, src=0)
-                            if int(stop_tensor.item()) == 1:
-                                if rank == 0:
-                                    print(f"Early stopping triggered at step {global_step}")
-                                    try:
-                                        self.save_checkpoint(step=global_step)
-                                    except Exception as e:
-                                        print(f"Warning: failed to save final checkpoint on early stop: {e}")
-                                torch.distributed.barrier()
-                                return
-                        torch.distributed.barrier()
-
-                        # Save checkpoint
-                        self.save_checkpoint(step=global_step)
-            except KeyboardInterrupt:
-                # graceful interrupt: save checkpoint and logs
+            for data in tqdm(
+                dataloader_iter,
+                initial=self.steps_per_epoch - remaining_steps,
+                total=self.steps_per_epoch,
+                desc=f"Epoch {epoch+1}/{self.config.trainer.total_epochs}",
+            ):
+                data = TensorDict(
+                    data, batch_size=self.config.data.train_batch_size
+                ).cuda()
+                metric = self.training_step(data)
                 if rank == 0:
-                    print("KeyboardInterrupt caught: saving checkpoint and logs before exit...")
-                    try:
-                        self.save_checkpoint(step=global_step)
-                    except Exception as e:
-                        print(f"Warning: failed to save checkpoint on interrupt: {e}")
-                    try:
-                        if getattr(self, 'file_logger', None) is not None:
-                            self.file_logger.close()
-                    except Exception:
-                        pass
-                # re-raise to stop training loop
-                raise
-            
+                    tracking.log(data=metric, step=global_step)
+                global_step += 1
+                self.current_step = global_step  # 更新当前步骤
+
+                # for early exit validation
+                if global_step >= self.total_training_steps:
+                    # Perform final validation
+                    val_losses = []
+                    for val_data in self.val_dataloader:
+                        val_data = TensorDict(
+                            val_data,
+                            batch_size=self.config.data.micro_batch_size_per_gpu,
+                        ).cuda()
+                        val_loss = self.validation_step(val_data)
+                        val_losses.append(val_loss)
+                    if rank == 0:
+                        avg_val_loss = torch.mean(torch.stack(val_losses))
+                        metric = {"val/loss": avg_val_loss.detach().item()}
+                        tracking.log(data=metric, step=global_step)
+                        # rank0 decides whether this is a new best
+                        improved = avg_val_loss.item() < (self.best_val_loss - self.min_delta)
+                        if improved:
+                            self.best_val_loss = avg_val_loss.item()
+                            self.no_improvement_count = 0
+                        else:
+                            self.no_improvement_count += 1
+                            if self.no_improvement_count >= self.max_no_improvement:
+                                print(f"Early stopping triggered: No improvement for {self.no_improvement_count} validations")
+                                return
+                        # pack decision and value into a tensor to broadcast
+                        flag_tensor = torch.tensor([1 if improved else 0], device="cuda")
+                        val_tensor = torch.tensor([avg_val_loss.item()], device="cuda")
+                    else:
+                        flag_tensor = torch.tensor([0], device="cuda")
+                        val_tensor = torch.tensor([0.0], device="cuda")
+
+                    # Broadcast decision and val loss to all ranks
+                    torch.distributed.broadcast(flag_tensor, src=0)
+                    torch.distributed.broadcast(val_tensor, src=0)
+                    improved = bool(flag_tensor.item())
+
+                    if improved:
+                        # all ranks call save_checkpoint to keep FSDP state consistent
+                        self.save_checkpoint(step=global_step, is_best=True)
+                    torch.distributed.barrier()
+                    return
+
+                if global_step % self.config.trainer.save_checkpoint_steps == 0:
+                    # Perform validation
+                    val_losses = []
+                    for val_data in self.val_dataloader:
+                        val_data = TensorDict(
+                            val_data,
+                            batch_size=self.config.data.micro_batch_size_per_gpu,
+                        ).cuda()
+                        val_loss = self.validation_step(val_data)
+                        val_losses.append(val_loss)
+                    if rank == 0:
+                        avg_val_loss = torch.mean(torch.stack(val_losses))
+                        metric = {"val/loss": avg_val_loss.detach().item()}
+                        tracking.log(data=metric, step=global_step)
+
+                        improved = avg_val_loss.item() < (self.best_val_loss - self.min_delta)
+                        if improved:
+                            self.best_val_loss = avg_val_loss.item()
+                            self.no_improvement_count = 0
+                        else:
+                            self.no_improvement_count += 1
+                            if self.no_improvement_count >= self.max_no_improvement:
+                                print(f"Early stopping triggered: No improvement for {self.no_improvement_count} validations")
+                                return
+                        flag_tensor = torch.tensor([1 if improved else 0], device="cuda")
+                    else:
+                        flag_tensor = torch.tensor([0], device="cuda")
+
+                    torch.distributed.broadcast(flag_tensor, src=0)
+                    improved = bool(flag_tensor.item())
+
+                    if improved:
+                        self.save_checkpoint(step=global_step, is_best=True)
+                    torch.distributed.barrier()
+                    
             # validation
             val_losses = []
             for data in self.val_dataloader:
@@ -1010,52 +1041,26 @@ class FSDPSFTTrainer(object):
                 val_loss = torch.mean(torch.stack(val_losses))
                 metric = {"val/loss": val_loss.detach().item()}
                 tracking.log(data=metric, step=global_step)
-                if getattr(self, 'file_logger', None) is not None:
-                    try:
-                        self.file_logger.log(metric, step=global_step)
-                        self.loss_history.append({'step': global_step, 'val/loss': metric['val/loss']})
-                    except Exception as e:
-                        print(f"Warning: failed to persist val metric: {e}")
-                # Early stopping decision (rank 0) with distributed broadcast
-                stop_tensor = torch.zeros(1, dtype=torch.int64, device='cuda')
-                if self.early_stop_patience is not None and rank == 0:
-                    val = float(metric['val/loss'])
-                    if val + self.early_stop_min_delta < self.best_val_loss:
-                        self.best_val_loss = val
-                        self.no_improve_steps = 0
-                    else:
-                        self.no_improve_steps += 1
-                    if self.no_improve_steps >= self.early_stop_patience:
-                        stop_tensor[0] = 1
-                torch.distributed.broadcast(stop_tensor, src=0)
-                if int(stop_tensor.item()) == 1:
-                    if rank == 0:
-                        print(f"Early stopping triggered at step {global_step}")
-                        try:
-                            self.save_checkpoint(step=global_step)
-                        except Exception as e:
-                            print(f"Warning: failed to save final checkpoint on early stop: {e}")
-                    torch.distributed.barrier()
-                    return
+
+                improved = val_loss.item() < (self.best_val_loss - self.min_delta)
+                if improved:
+                    self.best_val_loss = val_loss.item()
+                    self.no_improvement_count = 0
+                else:
+                    self.no_improvement_count += 1
+                    if self.no_improvement_count >= self.max_no_improvement:
+                        print(f"Early stopping triggered: No improvement for {self.no_improvement_count} validations")
+                        return
+                flag_tensor = torch.tensor([1 if improved else 0], device="cuda")
+            else:
+                flag_tensor = torch.tensor([0], device="cuda")
+
+            torch.distributed.broadcast(flag_tensor, src=0)
+            improved = bool(flag_tensor.item())
+
+            if improved:
+                self.save_checkpoint(step=global_step, is_best=True)
             torch.distributed.barrier()
-
-            # save checkpoint
-            self.save_checkpoint(step=global_step)
-
-        # Close file logger if exists
-        if rank == 0 and getattr(self, 'file_logger', None) is not None:
-            try:
-                # also save loss_history
-                hist_path = os.path.join(self.config.trainer.default_local_dir, 'loss_history.json')
-                try:
-                    with open(hist_path, 'w', encoding='utf-8') as hf:
-                        import json
-                        json.dump(self.loss_history, hf, ensure_ascii=False, indent=2)
-                except Exception as ee:
-                    print(f"Warning: failed to save loss history: {ee}")
-                self.file_logger.close()
-            except Exception:
-                pass
 
 
 @hydra.main(config_path="config", config_name="sft_trainer", version_base=None)
