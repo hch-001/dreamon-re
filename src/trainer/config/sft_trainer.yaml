@@ -20,6 +20,7 @@ data:
   use_uniform_merge_prob: 0.5
 model:
   partial_pretrain: ~/models/gemma-1.1-7b-it
+  revision: null
   fsdp_config:
     wrap_policy:
       min_num_params: 0

@@ -188,6 +188,9 @@ class FSDPSFTTrainer(object):
         # Check if resuming training
         self.resume_training = getattr(self.config.trainer, "resume_training", False)
         self.resume_checkpoint_path = getattr(self.config.trainer, "resume_path", None)
+        self.model_revision = getattr(self.config.model, "revision", None)
+        if isinstance(self.model_revision, str) and self.model_revision.strip().lower() in ("", "null"):
+            self.model_revision = None
 
         # build tokenizer first
         if self.resume_training and self.resume_checkpoint_path:
@@ -201,9 +204,10 @@ class FSDPSFTTrainer(object):
             )
 
         from verl.utils import hf_tokenizer
-        self.tokenizer = hf_tokenizer(
-            local_model_path, trust_remote_code=self.config.model.trust_remote_code
-        )
+        tokenizer_kwargs = {"trust_remote_code": self.config.model.trust_remote_code}
+        if self.model_revision:
+            tokenizer_kwargs["revision"] = self.model_revision
+        self.tokenizer = hf_tokenizer(local_model_path, **tokenizer_kwargs)
         if self.config.data.chat_template is not None:
             raise ValueError("Apply Chat template from config is not supported yet.")
 
@@ -351,9 +355,13 @@ class FSDPSFTTrainer(object):
         log_gpu_memory_usage("Before model allocation", logger=logger)
 
         trust_remote_code = self.config.model.trust_remote_code
+        pretrained_kwargs = {"trust_remote_code": trust_remote_code}
+        if checkpoint_path is None and self.model_revision:
+            pretrained_kwargs["revision"] = self.model_revision
+
         # load config first
         config = AutoConfig.from_pretrained(
-            local_model_path, trust_remote_code=trust_remote_code
+            local_model_path, **pretrained_kwargs
         )
         if self.config.ulysses_sequence_parallel_size > 1:
             assert (
@@ -379,7 +387,7 @@ class FSDPSFTTrainer(object):
                 config=config,
                 torch_dtype=torch.bfloat16,
                 attn_implementation="flash_attention_2",
-                trust_remote_code=trust_remote_code,
+                **pretrained_kwargs,
             )
 
             # Apply Liger kernel if use_liger is enabled

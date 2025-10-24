@@ -22,6 +22,10 @@ while [[ $# -gt 0 ]]; do
       min_delta="$2"
       shift 2
       ;;
+    --revision)
+      revision="$2"
+      shift 2
+      ;;
     --help|-h)
       cat <<'EOF'
 用法: ./run_dreamon.sh [options]
@@ -30,6 +34,7 @@ while [[ $# -gt 0 ]]; do
   --lr <float>         学习率 (默认: 1e-5)
   --patience <int>     早停耐心步数 (默认: 2)
   --min-delta <float>  早停最小提升阈值 (默认: 1e-4)
+  --revision <name>    HuggingFace 模型的 revision/branch/tag (默认: null)
 EOF
       exit 0
       ;;
@@ -57,6 +62,9 @@ export TRANSFORMERS_CACHE=/workspace/.cache/huggingface
 
 echo "Training with learning rate: $lr"
 echo "Checkpoint directory: $ckpt_dir"
+if [[ "$revision" != "null" ]]; then
+  echo "Model revision: $revision"
+fi
 echo "Early stopping patience: $patience"
 echo "Early stopping min_delta: $min_delta"
 
@@ -77,6 +85,7 @@ torchrun --standalone --nnodes=1 --nproc_per_node=2      --master-port 12346 \
     optim.lr=1e-5 \
     data.micro_batch_size_per_gpu=8 \
     model.partial_pretrain=Dream-org/Dream-Coder-v0-Base-7B \
+    model.revision=dev2 \
     model.trust_remote_code=True \
     model.enable_gradient_checkpointing=True \
     trainer.default_local_dir=$ckpt_dir \
@@ -86,6 +95,4 @@ torchrun --standalone --nnodes=1 --nproc_per_node=2      --master-port 12346 \
     trainer.logger=['console'] \
     trainer.default_hdfs_dir=null \
     trainer.save_checkpoint_steps=400 \
-    trainer.patience=${patience} \
-    trainer.min_delta=${min_delta}\
     ulysses_sequence_parallel_size=1
