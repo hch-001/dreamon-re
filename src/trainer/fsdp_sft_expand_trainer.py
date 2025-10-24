@@ -74,6 +74,14 @@ logger.setLevel(os.getenv("VERL_SFT_LOGGING_LEVEL", "WARN"))
 
 
 def extract_step(path):
+    """从检查点名称或路径中提取步数。
+
+    Args:
+        path (str): 检查点名称或路径，格式如 "global_step_1000" 或 "/path/to/global_step_1000"
+        
+    Returns:
+        int | None: 检查点步数，如果无法提取则返回 None
+    """
     match = re.search(r"global_step_(\d+)", path)
     if match:
         return int(match.group(1))
@@ -97,6 +105,10 @@ def convert_to_regular_types(obj):
     return obj
 
 class FSDPSFTTrainer(object):
+    # 全局计数器
+    ex_num = 0  # expand token的总数
+    ma_num = 0  # mask token的总数
+    total_batches = 0  # 处理的总批次数
 
     def __init__(
         self, config, device_mesh: DeviceMesh, ulysses_device_mesh: DeviceMesh
@@ -496,15 +508,41 @@ class FSDPSFTTrainer(object):
             ):
                 # Load optimizer state - rank 0 loads, others receive broadcast
                 if self.device_mesh.get_rank() == 0:
-                    optim_state = torch.load(optimizer_state_path)
+                    try:
+                        optim_state = torch.load(optimizer_state_path)
+                        
+                        # Check if optimizer state was saved in chunks
+                        if isinstance(optim_state, dict) and optim_state.get("__chunked__", False):
+                            print("Loading chunked optimizer state...")
+                            num_chunks = optim_state["__num_chunks__"]
+                            complete_state = {}
+                            
+                            # Load all chunks
+                            for i in range(num_chunks):
+                                chunk_path = os.path.join(os.path.dirname(optimizer_state_path), 
+                                                        f"optimizer_state_chunk_{i}.pt")
+                                if os.path.exists(chunk_path):
+                                    chunk = torch.load(chunk_path)
+                                    complete_state.update(chunk)
+                            optim_state = complete_state
+                    except Exception as e:
+                        print(f"Warning: Failed to load optimizer state: {e}")
+                        optim_state = None
                 else:
                     optim_state = None
 
-                # Use FSDP utility to load optimizer state
-                optim_state_dict = FSDP.scatter_full_optim_state_dict(
-                    optim_state, self.fsdp_model
-                )
-                self.optimizer.load_state_dict(optim_state_dict)
+                try:
+                    if optim_state is not None:
+                        # Use FSDP utility to load optimizer state
+                        optim_state_dict = FSDP.scatter_full_optim_state_dict(
+                            optim_state, self.fsdp_model
+                        )
+                        self.optimizer.load_state_dict(optim_state_dict)
+                    else:
+                        print("Warning: Starting with fresh optimizer state")
+                except Exception as e:
+                    print(f"Warning: Failed to load optimizer state: {e}")
+                    print("Continuing with fresh optimizer state")
 
         self.current_epoch = epoch
         return global_step
@@ -523,6 +561,29 @@ class FSDPSFTTrainer(object):
         t = batch['t'].cuda()
         loss_mask = batch.pop("loss_mask").cuda().bool()
         loss_fct = nn.CrossEntropyLoss(reduction="none")
+        
+        # 统计mask tokens数量（loss_mask中1的数量）
+        ma_num_batch = torch.sum(loss_mask).item()
+        
+        # 统计expand tokens数量（labels中expand_id的出现次数）
+        # 使用数据集中预设的expand_token_id
+        expand_id = self.tokenizer.expand_token_id  # 固定值 151667
+        expand_id_tensor = torch.tensor(expand_id, device=labels.device, dtype=labels.dtype)
+        ex_num_batch = torch.sum(labels.eq(expand_id_tensor)).item()
+        
+        # 更新全局计数器
+        if self.device_mesh.get_rank() == 0:  # 只在主进程更新
+            self.__class__.ma_num += ma_num_batch
+            self.__class__.ex_num += ex_num_batch
+            self.__class__.total_batches += 1
+            
+            # 定期打印统计信息
+            if self.__class__.total_batches % 100 == 0:  # 每100个批次打印一次
+                print(f"\nStatistics after {self.__class__.total_batches} batches:")
+                print(f"Total expand tokens: {self.__class__.ex_num}")
+                print(f"Total mask tokens: {self.__class__.ma_num}")
+                print(f"Average expand tokens per batch: {self.__class__.ex_num / self.__class__.total_batches:.2f}")
+                print(f"Average mask tokens per batch: {self.__class__.ma_num / self.__class__.total_batches:.2f}\n")
 
         
 
@@ -700,10 +761,69 @@ class FSDPSFTTrainer(object):
         import shutil
         import os
 
-        # Create checkpoint directory
+        # 设置新检查点路径
         path = os.path.join(
             self.config.trainer.default_local_dir, f"global_step_{step}"
         )
+        
+        # 在主进程中执行检查点清理
+        if self.device_mesh.get_rank() == 0:
+            try:
+                # 1. 删除已存在的相同步数检查点
+                if os.path.exists(path):
+                    try:
+                        shutil.rmtree(path)
+                        print(f"Removed existing checkpoint at step {step}")
+                    except Exception as e:
+                        print(f"Warning: Failed to remove existing checkpoint: {e}")
+                
+                # 2. 确保本地目录存在
+                os.makedirs(self.config.trainer.default_local_dir, exist_ok=True)
+                
+                # 3. 获取所有检查点并排序
+                checkpoints = [d for d in os.listdir(self.config.trainer.default_local_dir)
+                            if os.path.isdir(os.path.join(self.config.trainer.default_local_dir, d))
+                            and d.startswith("global_step_")]
+                checkpoints.sort(key=lambda x: extract_step(x) or 0, reverse=True)
+                
+                # 4. 删除多余的检查点
+                max_keep = getattr(self.config.trainer, "max_checkpoints_to_keep", 3)
+                if max_keep > 0:
+                    # 获取所有检查点
+                    checkpoints = [d for d in os.listdir(self.config.trainer.default_local_dir)
+                                if os.path.isdir(os.path.join(self.config.trainer.default_local_dir, d))
+                                and d.startswith("global_step_")]
+                    
+                    # 按步数排序（最新的在前）
+                    checkpoints.sort(key=lambda x: extract_step(x) or 0, reverse=True)
+                    
+                    # 找出需要保留的检查点
+                    keep_checkpoints = set()
+                    
+                    # 1. 保留最新的N个
+                    keep_checkpoints.update(checkpoints[:max_keep])
+                    
+                    # 2. 保留最佳检查点（如果存在）
+                    if self.best_checkpoint_path:
+                        keep_checkpoints.add(os.path.basename(self.best_checkpoint_path))
+                    
+                    # 删除其他检查点
+                    for ckpt in checkpoints:
+                        if ckpt not in keep_checkpoints:
+                            ckpt_path = os.path.join(self.config.trainer.default_local_dir, ckpt)
+                            try:
+                                shutil.rmtree(ckpt_path)
+                                print(f"Cleaned up old checkpoint: {ckpt}")
+                                
+                                # 同时清理HDFS上的副本
+                                if self.config.trainer.default_hdfs_dir:
+                                    remote_path = os.path.join(self.config.trainer.default_hdfs_dir, ckpt)
+                                    if hdfs_io.exists(remote_path):
+                                        hdfs_io.rmtree(remote_path)
+                            except Exception as e:
+                                print(f"Warning: Failed to delete checkpoint {ckpt}: {e}")
+            except Exception as e:
+                print(f"Warning: Checkpoint cleanup failed: {e}")
         
         # 在保存新的checkpoint之前，如果是最佳checkpoint，先删除旧的
         if is_best and self.device_mesh.get_rank() == 0 and self.best_checkpoint_path:
@@ -727,18 +847,57 @@ class FSDPSFTTrainer(object):
             except Exception as e:
                 print(f"Warning: Failed to delete previous checkpoint: {e}")
 
-        # Save model state
+        # Save model state with safety checks
         model_cfg = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
 
-        with FSDP.state_dict_type(self.fsdp_model, StateDictType.FULL_STATE_DICT, model_cfg):
-            model_state = self.fsdp_model.state_dict()
-            optim_state = FSDP.full_optim_state_dict(self.fsdp_model, self.optimizer)
+        try:
+            with FSDP.state_dict_type(self.fsdp_model, StateDictType.FULL_STATE_DICT, model_cfg):
+                model_state = self.fsdp_model.state_dict()
+                
+                # Get optimizer state with extra safety checks
+                try:
+                    optim_state = FSDP.full_optim_state_dict(self.fsdp_model, self.optimizer)
+                    
+                    # Check if optimizer state is too large (>2GB)
+                    import sys
+                    if sys.getsizeof(optim_state) > 2 * 1024 * 1024 * 1024:  # 2GB
+                        print("Warning: Optimizer state is very large. Attempting chunked save...")
+                        # Split optimizer state into chunks
+                        from itertools import islice
+                        def chunk_dict(data, size=1000):
+                            it = iter(data.items())
+                            for i in range(0, len(data), size):
+                                yield dict(islice(it, size))
+                        
+                        chunks = list(chunk_dict(optim_state))
+                        optim_state = {"__chunked__": True, "__num_chunks__": len(chunks)}
+                        
+                        # Save chunks separately
+                        for i, chunk in enumerate(chunks):
+                            chunk_path = os.path.join(path, f"optimizer_state_chunk_{i}.pt")
+                            torch.save(chunk, chunk_path)
+                except Exception as e:
+                    print(f"Warning: Failed to save optimizer state: {e}")
+                    print("Continuing without optimizer state...")
+                    optim_state = {}  # Empty dict as fallback
+        except Exception as e:
+            print(f"Error getting model/optimizer state: {e}")
+            if self.device_mesh.get_rank() == 0:
+                print("Attempting emergency model save...")
+                try:
+                    # Try direct save without FSDP state dict
+                    self.model.save_pretrained(path)
+                    model_state = None  # Signal to skip normal save
+                except Exception as e2:
+                    print(f"Emergency save failed: {e2}")
+                    raise  # Re-raise if both attempts failed
 
-        # Save training state
+        # Save training state (protected)
         training_state = {
             "lr_scheduler": self.lr_scheduler.state_dict(),
             "global_step": step,
             "epoch": self.current_epoch,
+            "optimizer_chunked": getattr(optim_state, "__chunked__", False)
         }
 
         # Save on rank 0 only
@@ -785,17 +944,56 @@ class FSDPSFTTrainer(object):
                         with open(gen_config_path, "w") as f:
                             json.dump(gen_config_dict, f, indent=2)
                     
-                    # Save model without generation config
+                    # Save model with a proxy generation_config to avoid non-serializable attrs
                     gen_config_backup = None
-                    if hasattr(self.model, "generation_config"):
+                    proxy_assigned = False
+                    if hasattr(self.model, "generation_config") and self.model.generation_config is not None:
                         gen_config_backup = self.model.generation_config
-                        self.model.generation_config = None
+
+                        class _GenCfgProxy:
+                            def __init__(self, orig):
+                                # take a filtered snapshot of serializable items
+                                try:
+                                    cfg = orig.to_dict()
+                                except Exception:
+                                    # fallback: use __dict__ shallow copy
+                                    cfg = getattr(orig, "__dict__", {})
+                                # filter out callables
+                                self._cfg = {k: v for k, v in cfg.items() if not callable(v)}
+
+                            def to_dict(self):
+                                return dict(self._cfg)
+
+                            def save_pretrained(self, save_directory):
+                                # write the filtered dict to generation_config.json
+                                os.makedirs(save_directory, exist_ok=True)
+                                out = os.path.join(save_directory, "generation_config.json")
+                                with open(out, "w") as f:
+                                    json.dump(self._cfg, f, indent=2)
+
+                            def __getattr__(self, name):
+                                # provide graceful defaults for other accesses
+                                if name == "to_dict":
+                                    return self.to_dict
+                                raise AttributeError(name)
+
+                        # assign proxy so transformers will call proxy.save_pretrained
+                        try:
+                            self.model.generation_config = _GenCfgProxy(gen_config_backup)
+                            proxy_assigned = True
+                        except Exception:
+                            # if assignment fails, keep original and let save_pretrained handle it
+                            proxy_assigned = False
+
                     try:
                         self.model.save_pretrained(path, state_dict=model_state)
                     finally:
-                        # Restore generation config
-                        if gen_config_backup is not None:
-                            self.model.generation_config = gen_config_backup
+                        # Restore original generation_config
+                        if gen_config_backup is not None and proxy_assigned:
+                            try:
+                                self.model.generation_config = gen_config_backup
+                            except Exception:
+                                pass
                 finally:
                     # restore original validate if we wrapped it
                     if _saved_validate is not None and gen_cfg is not None:
@@ -804,20 +1002,87 @@ class FSDPSFTTrainer(object):
                         except Exception:
                             pass
                 self.tokenizer.save_pretrained(path)
-                torch.save(optim_state, os.path.join(path, "optimizer_state.pt"))
-                torch.save(training_state, os.path.join(path, "training_state.pt"))
+                
+                # Save optimizer state (possibly chunked)
+                if isinstance(optim_state, dict) and optim_state.get("__chunked__", False):
+                    # Save main optimizer state file with chunk info
+                    torch.save(optim_state, os.path.join(path, "optimizer_state.pt"))
+                else:
+                    # Standard save for normal sized optimizer state
+                    try:
+                        torch.save(optim_state, os.path.join(path, "optimizer_state.pt"))
+                    except Exception as e:
+                        print(f"Warning: Failed to save optimizer state: {e}")
+                        print("Saving empty optimizer state as fallback")
+                        torch.save({}, os.path.join(path, "optimizer_state.pt"))
+                
+                # Save training state last (always try to save this)
+                try:
+                    torch.save(training_state, os.path.join(path, "training_state.pt"))
+                except Exception as e:
+                    print(f"Warning: Failed to save training state: {e}")
+                    # Save minimal training state as fallback
+                    minimal_state = {"global_step": step, "epoch": self.current_epoch}
+                    torch.save(minimal_state, os.path.join(path, "training_state.pt"))
 
-                # 3. 复制到HDFS
+                # 3. 清理HDFS上的旧检查点并复制新检查点
                 if self.config.trainer.default_hdfs_dir:
                     try:
+                        # 先删除HDFS上已存在的相同步数检查点
+                        hdfs_path = os.path.join(self.config.trainer.default_hdfs_dir, f"global_step_{step}")
+                        if hdfs_io.exists(hdfs_path):
+                            hdfs_io.rmtree(hdfs_path)
+                            print(f"Removed existing HDFS checkpoint at step {step}")
+                        
+                        # 复制新的检查点到HDFS
                         hdfs_io.makedirs(self.config.trainer.default_hdfs_dir, exist_ok=True)
                         hdfs_io.copy(src=path, dst=self.config.trainer.default_hdfs_dir, dirs_exist_ok=True)
+                        print(f"Successfully copied checkpoint to HDFS at {hdfs_path}")
+                        
+                        # 清理HDFS上的旧检查点
+                        if max_keep > 0:
+                            hdfs_checkpoints = [d for d in hdfs_io.listdir(self.config.trainer.default_hdfs_dir)
+                                             if d.startswith("global_step_")]
+                            hdfs_checkpoints.sort(key=lambda x: extract_step(x) or 0, reverse=True)
+                            
+                            # 保留最新的max_keep个和最佳检查点
+                            keep_checkpoints = set(hdfs_checkpoints[:max_keep])
+                            if self.best_checkpoint_path:
+                                keep_checkpoints.add(os.path.basename(self.best_checkpoint_path))
+                            
+                            # 删除其他检查点
+                            for ckpt in hdfs_checkpoints:
+                                if ckpt not in keep_checkpoints:
+                                    hdfs_ckpt_path = os.path.join(self.config.trainer.default_hdfs_dir, ckpt)
+                                    try:
+                                        hdfs_io.rmtree(hdfs_ckpt_path)
+                                        print(f"Cleaned up old HDFS checkpoint: {ckpt}")
+                                    except Exception as e:
+                                        print(f"Warning: Failed to delete HDFS checkpoint {ckpt}: {e}")
                     except Exception as e:
-                        print(f"Warning: Failed to copy to HDFS: {e}")
+                        print(f"Warning: HDFS operations failed: {e}")
                 
                 # 4. 保存成功后更新best_checkpoint_path
                 if is_best:
+                    old_best = self.best_checkpoint_path
                     self.best_checkpoint_path = path
+                    
+                    # 如果有旧的最佳检查点且不是当前检查点，删除它
+                    if old_best and old_best != path:
+                        try:
+                            if os.path.exists(old_best):
+                                shutil.rmtree(old_best)
+                                print(f"Removed old best checkpoint: {old_best}")
+                            
+                            # 同时删除HDFS上的旧最佳检查点
+                            if self.config.trainer.default_hdfs_dir:
+                                old_best_hdfs = os.path.join(self.config.trainer.default_hdfs_dir,
+                                                           os.path.basename(old_best))
+                                if hdfs_io.exists(old_best_hdfs):
+                                    hdfs_io.rmtree(old_best_hdfs)
+                                    print(f"Removed old best checkpoint from HDFS: {old_best_hdfs}")
+                        except Exception as e:
+                            print(f"Warning: Failed to remove old best checkpoint: {e}")
 
             except Exception as e:
                 print(f"Error in save_checkpoint: {e}")
@@ -1061,6 +1326,16 @@ class FSDPSFTTrainer(object):
             if improved:
                 self.save_checkpoint(step=global_step, is_best=True)
             torch.distributed.barrier()
+            
+            # 在训练结束时打印最终统计信息
+            if self.device_mesh.get_rank() == 0:
+                print("\n=== Final Statistics ===")
+                print(f"Total batches processed: {self.__class__.total_batches}")
+                print(f"Total expand tokens: {self.__class__.ex_num}")
+                print(f"Total mask tokens: {self.__class__.ma_num}")
+                print(f"Average expand tokens per batch: {self.__class__.ex_num / max(1, self.__class__.total_batches):.2f}")
+                print(f"Average mask tokens per batch: {self.__class__.ma_num / max(1, self.__class__.total_batches):.2f}")
+                print("=====================\n")
 
 
 @hydra.main(config_path="config", config_name="sft_trainer", version_base=None)
