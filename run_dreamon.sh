@@ -1,6 +1,44 @@
 #!/bin/bash
 dataset=opencoder-stage2-edu
 lr=1e-5
+patience=2
+min_delta=1e-4
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --dataset)
+      dataset="$2"
+      shift 2
+      ;;
+    --lr)
+      lr="$2"
+      shift 2
+      ;;
+    --patience)
+      patience="$2"
+      shift 2
+      ;;
+    --min-delta)
+      min_delta="$2"
+      shift 2
+      ;;
+    --help|-h)
+      cat <<'EOF'
+用法: ./run_dreamon.sh [options]
+可选项:
+  --dataset <name>     训练数据集名称 (默认: opencoder-stage2-edu)
+  --lr <float>         学习率 (默认: 1e-5)
+  --patience <int>     早停耐心步数 (默认: 2)
+  --min-delta <float>  早停最小提升阈值 (默认: 1e-4)
+EOF
+      exit 0
+      ;;
+    *)
+      echo "未知参数: $1" >&2
+      exit 1
+      ;;
+  esac
+done
 
 # Create unique ckpt_dir for each LR
 ckpt_dir=checkpoints/infill_dreamon
@@ -14,8 +52,13 @@ mkdir -p "$log_dir"
 exec > >(tee "$stdout_log")
 exec 2> >(tee "$stderr_log" >&2)
 
+export HF_HOME=/workspace/.cache/huggingface
+export TRANSFORMERS_CACHE=/workspace/.cache/huggingface
+
 echo "Training with learning rate: $lr"
 echo "Checkpoint directory: $ckpt_dir"
+echo "Early stopping patience: $patience"
+echo "Early stopping min_delta: $min_delta"
 
 CUDA_VISIBLE_DEVICES=0,1 \
 torchrun --standalone --nnodes=1 --nproc_per_node=2      --master-port 12346 \
@@ -43,6 +86,6 @@ torchrun --standalone --nnodes=1 --nproc_per_node=2      --master-port 12346 \
     trainer.logger=['console'] \
     trainer.default_hdfs_dir=null \
     trainer.save_checkpoint_steps=400 \
-    trainer.patience=2 \
-    trainer.min_delta=0.0001\
+    trainer.patience=${patience} \
+    trainer.min_delta=${min_delta}\
     ulysses_sequence_parallel_size=1
