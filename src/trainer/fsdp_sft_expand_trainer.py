@@ -176,7 +176,14 @@ class FSDPSFTTrainer(object):
         
         # Early stopping configuration
         self.no_improvement_count = 0
-        self.max_no_improvement = getattr(self.config.trainer, "max_no_improvement", 1)  # 默认值为1
+        patience_cfg = getattr(self.config.trainer, "patient", None)
+        if patience_cfg is None:
+            patience_cfg = getattr(self.config.trainer, "patience", None)
+        if patience_cfg is None:
+            patience_cfg = getattr(self.config.trainer, "max_no_improvement", None)
+        self.early_stopping_patience = (
+            int(patience_cfg) if patience_cfg is not None else None
+        )
 
         # Check if resuming training
         self.resume_training = getattr(self.config.trainer, "resume_training", False)
@@ -700,7 +707,7 @@ class FSDPSFTTrainer(object):
 
                 if do_backward:
                     loss.backward()
-                return loss
+                return loss, ex_num_batch, ma_num_batch
 
     def training_step(self, batch: TensorDict):
         self.fsdp_model.train()
@@ -714,13 +721,17 @@ class FSDPSFTTrainer(object):
         micro_batches = batch.split(self.config.data.micro_batch_size_per_gpu)
         n_micro_batches = len(micro_batches)
         step_loss = 0
+        expand_token_count = 0
+        mask_token_count = 0
         for micro_batch in micro_batches:
-            loss = (
-                self._compute_loss_and_backward(batch=micro_batch, do_backward=False)
-                / n_micro_batches
+            loss, ex_count, mask_count = self._compute_loss_and_backward(
+                batch=micro_batch, do_backward=False
             )
+            loss = loss / n_micro_batches
             loss.backward()
             step_loss += loss.item()
+            expand_token_count += ex_count
+            mask_token_count += mask_count
 
         grad_norm = self.fsdp_model.clip_grad_norm_(
             max_norm=self.config.optim.clip_grad
@@ -741,18 +752,88 @@ class FSDPSFTTrainer(object):
 
         step_loss = torch.tensor(step_loss).cuda()
         torch.distributed.all_reduce(step_loss, op=torch.distributed.ReduceOp.AVG)
+        counts_tensor = torch.tensor(
+            [expand_token_count, mask_token_count], device="cuda", dtype=torch.float64
+        )
+        torch.distributed.all_reduce(counts_tensor, op=torch.distributed.ReduceOp.SUM)
+        expand_token_count = counts_tensor[0].item()
+        mask_token_count = counts_tensor[1].item()
+        expand_ratio = 0.0
+        if mask_token_count > 0:
+            expand_ratio = expand_token_count / mask_token_count * 100.0
         return {
             "train/loss": step_loss.detach().item(),
             "train/lr(1e-3)": lr * 1e3,
             "train/grad_norm": grad_norm,
+            "train/expand_ratio(%)": expand_ratio,
         }
 
     def validation_step(self, batch: TensorDict):
         self.fsdp_model.eval()
         with torch.no_grad():
-            loss = self._compute_loss_and_backward(batch, do_backward=False)
+            loss, _, _ = self._compute_loss_and_backward(batch, do_backward=False)
             torch.distributed.all_reduce(loss, op=torch.distributed.ReduceOp.AVG)
         return loss
+
+    def _update_early_stopping(self, val_loss_value: float):
+        improved = val_loss_value < (self.best_val_loss - self.min_delta)
+        if improved:
+            self.best_val_loss = val_loss_value
+            self.no_improvement_count = 0
+        else:
+            self.no_improvement_count += 1
+        patience = self.early_stopping_patience
+        should_stop = False
+        if patience is not None and patience > 0:
+            should_stop = self.no_improvement_count >= patience
+        return improved, should_stop
+
+    def _run_validation(self, global_step: int, tracking=None):
+        rank = self.device_mesh.get_rank()
+        val_losses = []
+        for val_data in self.val_dataloader:
+            val_data = TensorDict(
+                val_data, batch_size=self.config.data.micro_batch_size_per_gpu
+            ).cuda()
+            loss = self.validation_step(val_data)
+            val_losses.append(loss)
+
+        val_loss = torch.mean(torch.stack(val_losses))
+        val_loss_value = val_loss.detach().item()
+
+        improved = False
+        should_stop = False
+        if rank == 0:
+            metric = {"val/loss": val_loss_value}
+            if tracking is not None:
+                tracking.log(data=metric, step=global_step)
+            improved, should_stop = self._update_early_stopping(val_loss_value)
+
+        # Broadcast validation outcome and synchronize internal state
+        state_tensor = torch.tensor(
+            [
+                val_loss_value if rank == 0 else 0.0,
+                self.best_val_loss if rank == 0 else 0.0,
+                float(self.no_improvement_count if rank == 0 else 0.0),
+                1.0 if improved else 0.0,
+                1.0 if should_stop else 0.0,
+            ],
+            device="cuda",
+            dtype=torch.float64,
+        )
+        torch.distributed.broadcast(state_tensor, src=0)
+        if rank != 0:
+            val_loss_value = state_tensor[0].item()
+            self.best_val_loss = state_tensor[1].item()
+            self.no_improvement_count = int(state_tensor[2].item())
+            improved = bool(state_tensor[3].item())
+            should_stop = bool(state_tensor[4].item())
+
+        if improved:
+            self.save_checkpoint(step=global_step, is_best=True)
+        torch.distributed.barrier()
+
+        return improved, should_stop, val_loss_value
 
     def save_checkpoint(self, step, is_best=False):
         """Save model, optimizer, and training state."""
@@ -1084,6 +1165,45 @@ class FSDPSFTTrainer(object):
                         except Exception as e:
                             print(f"Warning: Failed to remove old best checkpoint: {e}")
 
+                    # 仅保留当前最佳checkpoint
+                    if self.device_mesh.get_rank() == 0:
+                        checkpoint_dir = self.config.trainer.default_local_dir
+                        try:
+                            for ckpt in os.listdir(checkpoint_dir):
+                                ckpt_path = os.path.join(checkpoint_dir, ckpt)
+                                if (
+                                    ckpt_path != path
+                                    and ckpt.startswith("global_step_")
+                                    and os.path.isdir(ckpt_path)
+                                ):
+                                    shutil.rmtree(ckpt_path)
+                                    print(f"Removed stale checkpoint: {ckpt_path}")
+                        except Exception as e:
+                            print(f"Warning: Failed to clean extra checkpoints: {e}")
+
+                        if self.config.trainer.default_hdfs_dir:
+                            try:
+                                hdfs_items = [
+                                    d
+                                    for d in hdfs_io.listdir(
+                                        self.config.trainer.default_hdfs_dir
+                                    )
+                                    if d.startswith("global_step_")
+                                ]
+                                for ckpt in hdfs_items:
+                                    if ckpt != os.path.basename(path):
+                                        hdfs_io.rmtree(
+                                            os.path.join(
+                                                self.config.trainer.default_hdfs_dir,
+                                                ckpt,
+                                            )
+                                        )
+                                        print(
+                                            f"Removed stale HDFS checkpoint: {ckpt}"
+                                        )
+                            except Exception as e:
+                                print(f"Warning: Failed to clean HDFS checkpoints: {e}")
+
             except Exception as e:
                 print(f"Error in save_checkpoint: {e}")
                 # 保存失败时，删除部分完成的新checkpoint
@@ -1142,6 +1262,7 @@ class FSDPSFTTrainer(object):
         rank = self.device_mesh.get_rank()
         hist_path = self.loss_history_path
         # TODO: add a unified tracking
+        tracking = None
         if rank == 0:
             tracking = Tracking(
                 project_name=self.config.trainer.project_name,
@@ -1211,121 +1332,50 @@ class FSDPSFTTrainer(object):
                     data, batch_size=self.config.data.train_batch_size
                 ).cuda()
                 metric = self.training_step(data)
-                if rank == 0:
+                if rank == 0 and tracking is not None:
                     tracking.log(data=metric, step=global_step)
                 global_step += 1
                 self.current_step = global_step  # 更新当前步骤
+                if rank == 0:
+                    ratio = metric.get("train/expand_ratio(%)")
+                    if ratio is not None:
+                        print(
+                            f"[Step {global_step}] expand tokens/mask tokens: {ratio:.2f}%"
+                        )
 
                 # for early exit validation
                 if global_step >= self.total_training_steps:
-                    # Perform final validation
-                    val_losses = []
-                    for val_data in self.val_dataloader:
-                        val_data = TensorDict(
-                            val_data,
-                            batch_size=self.config.data.micro_batch_size_per_gpu,
-                        ).cuda()
-                        val_loss = self.validation_step(val_data)
-                        val_losses.append(val_loss)
-                    if rank == 0:
-                        avg_val_loss = torch.mean(torch.stack(val_losses))
-                        metric = {"val/loss": avg_val_loss.detach().item()}
-                        tracking.log(data=metric, step=global_step)
-                        # rank0 decides whether this is a new best
-                        improved = avg_val_loss.item() < (self.best_val_loss - self.min_delta)
-                        if improved:
-                            self.best_val_loss = avg_val_loss.item()
-                            self.no_improvement_count = 0
-                        else:
-                            self.no_improvement_count += 1
-                            if self.no_improvement_count >= self.max_no_improvement:
-                                print(f"Early stopping triggered: No improvement for {self.no_improvement_count} validations")
-                                return
-                        # pack decision and value into a tensor to broadcast
-                        flag_tensor = torch.tensor([1 if improved else 0], device="cuda")
-                        val_tensor = torch.tensor([avg_val_loss.item()], device="cuda")
-                    else:
-                        flag_tensor = torch.tensor([0], device="cuda")
-                        val_tensor = torch.tensor([0.0], device="cuda")
-
-                    # Broadcast decision and val loss to all ranks
-                    torch.distributed.broadcast(flag_tensor, src=0)
-                    torch.distributed.broadcast(val_tensor, src=0)
-                    improved = bool(flag_tensor.item())
-
-                    if improved:
-                        # all ranks call save_checkpoint to keep FSDP state consistent
-                        self.save_checkpoint(step=global_step, is_best=True)
-                    torch.distributed.barrier()
+                    _, should_stop, _ = self._run_validation(
+                        global_step, tracking if rank == 0 else None
+                    )
+                    if rank == 0 and should_stop:
+                        print(
+                            f"Early stopping triggered: no improvement for {self.no_improvement_count} validations"
+                        )
                     return
 
                 if global_step % self.config.trainer.save_checkpoint_steps == 0:
-                    # Perform validation
-                    val_losses = []
-                    for val_data in self.val_dataloader:
-                        val_data = TensorDict(
-                            val_data,
-                            batch_size=self.config.data.micro_batch_size_per_gpu,
-                        ).cuda()
-                        val_loss = self.validation_step(val_data)
-                        val_losses.append(val_loss)
-                    if rank == 0:
-                        avg_val_loss = torch.mean(torch.stack(val_losses))
-                        metric = {"val/loss": avg_val_loss.detach().item()}
-                        tracking.log(data=metric, step=global_step)
-
-                        improved = avg_val_loss.item() < (self.best_val_loss - self.min_delta)
-                        if improved:
-                            self.best_val_loss = avg_val_loss.item()
-                            self.no_improvement_count = 0
-                        else:
-                            self.no_improvement_count += 1
-                            if self.no_improvement_count >= self.max_no_improvement:
-                                print(f"Early stopping triggered: No improvement for {self.no_improvement_count} validations")
-                                return
-                        flag_tensor = torch.tensor([1 if improved else 0], device="cuda")
-                    else:
-                        flag_tensor = torch.tensor([0], device="cuda")
-
-                    torch.distributed.broadcast(flag_tensor, src=0)
-                    improved = bool(flag_tensor.item())
-
-                    if improved:
-                        self.save_checkpoint(step=global_step, is_best=True)
-                    torch.distributed.barrier()
+                    _, should_stop, _ = self._run_validation(
+                        global_step, tracking if rank == 0 else None
+                    )
+                    if rank == 0 and should_stop:
+                        print(
+                            f"Early stopping triggered: no improvement for {self.no_improvement_count} validations"
+                        )
+                        return
+                    if should_stop:
+                        return
                     
             # validation
-            val_losses = []
-            for data in self.val_dataloader:
-                data = TensorDict(
-                    data, batch_size=self.config.data.micro_batch_size_per_gpu
-                ).cuda()
-                val_loss = self.validation_step(data)
-                val_losses.append(val_loss)
-            if rank == 0:
-                val_loss = torch.mean(torch.stack(val_losses))
-                metric = {"val/loss": val_loss.detach().item()}
-                tracking.log(data=metric, step=global_step)
-
-                improved = val_loss.item() < (self.best_val_loss - self.min_delta)
-                if improved:
-                    self.best_val_loss = val_loss.item()
-                    self.no_improvement_count = 0
-                else:
-                    self.no_improvement_count += 1
-                    if self.no_improvement_count >= self.max_no_improvement:
-                        print(f"Early stopping triggered: No improvement for {self.no_improvement_count} validations")
-                        return
-                flag_tensor = torch.tensor([1 if improved else 0], device="cuda")
-            else:
-                flag_tensor = torch.tensor([0], device="cuda")
-
-            torch.distributed.broadcast(flag_tensor, src=0)
-            improved = bool(flag_tensor.item())
-
-            if improved:
-                self.save_checkpoint(step=global_step, is_best=True)
-            torch.distributed.barrier()
+            _, should_stop, _ = self._run_validation(
+                global_step, tracking if rank == 0 else None
+            )
+            if rank == 0 and should_stop:
+                print(
+                    f"Early stopping triggered: no improvement for {self.no_improvement_count} validations"
+                )
+            if should_stop:
+                return
             
             # 在训练结束时打印最终统计信息
             if self.device_mesh.get_rank() == 0:

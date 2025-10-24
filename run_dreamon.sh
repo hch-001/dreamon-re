@@ -42,5 +42,7 @@ torchrun --standalone --nnodes=1 --nproc_per_node=2      --master-port 12346 \
     trainer.experiment_name=${dataset}_${lr}_infill_$(date +%F) \
     trainer.logger=['console'] \
     trainer.default_hdfs_dir=null \
-    trainer.save_checkpoint_steps=200 \
+    trainer.save_checkpoint_steps=400 \
+    trainer.patience=2 \
+    trainer.min_delta=0.0001\
     ulysses_sequence_parallel_size=1
